@@ -2,11 +2,11 @@ import os
 import aiohttp
 import traceback
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import RedirectResponse
+from fastapi.responses import RedirectResponse, HTMLResponse
 from motor.motor_asyncio import AsyncIOMotorClient
 
 # =========================
-# ENV (with safety debug)
+# ENV
 # =========================
 CLIENT_ID = os.getenv("ROBLOX_CLIENT_ID")
 CLIENT_SECRET = os.getenv("ROBLOX_CLIENT_SECRET")
@@ -22,7 +22,6 @@ def check_env():
     if missing:
         raise RuntimeError(f"Missing env vars: {missing}")
 
-# run check at startup
 check_env()
 
 # =========================
@@ -42,10 +41,7 @@ col = db["linked_ids"]
 # =========================
 @app.get("/")
 async def root():
-    return {
-        "status": "running",
-        "debug": "ok",
-    }
+    return {"status": "running", "debug": "ok"}
 
 # =========================
 # AUTH START
@@ -67,7 +63,62 @@ async def auth(discord_id: str):
     return RedirectResponse(url)
 
 # =========================
-# CALLBACK (FULL DEBUG)
+# SUCCESS PAGE
+# =========================
+def verified_page():
+    return """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Verified</title>
+        <meta http-equiv="refresh" content="5;url=https://discord.com">
+        <style>
+            body {
+                margin: 0;
+                height: 100vh;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                background: #0b0f14;
+                font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+                color: white;
+            }
+
+            .card {
+                text-align: center;
+                padding: 40px 50px;
+                border-radius: 14px;
+                background: rgba(255, 255, 255, 0.04);
+                border: 1px solid rgba(255, 255, 255, 0.08);
+                backdrop-filter: blur(10px);
+            }
+
+            h1 {
+                font-size: 42px;
+                letter-spacing: 2px;
+                margin: 0;
+                color: #22c55e;
+            }
+
+            p {
+                margin-top: 10px;
+                font-size: 15px;
+                color: rgba(255, 255, 255, 0.7);
+            }
+        </style>
+    </head>
+
+    <body>
+        <div class="card">
+            <h1>VERIFIED</h1>
+            <p>You’re all set — feel free to close this page.</p>
+        </div>
+    </body>
+    </html>
+    """
+
+# =========================
+# CALLBACK
 # =========================
 @app.get("/callback")
 async def callback(request: Request):
@@ -84,9 +135,7 @@ async def callback(request: Request):
 
         async with aiohttp.ClientSession() as session:
 
-            # =========================
-            # TOKEN REQUEST (DEBUG)
-            # =========================
+            # TOKEN
             async with session.post(
                 "https://apis.roblox.com/oauth/v1/token",
                 data={
@@ -102,38 +151,28 @@ async def callback(request: Request):
                 print("TOKEN STATUS:", r.status)
                 print("TOKEN RESPONSE:", token_text)
 
-                try:
-                    token = await r.json()
-                except:
-                    raise HTTPException(status_code=400, detail=f"Token not JSON: {token_text}")
+                token = await r.json()
 
                 if r.status != 200 or "access_token" not in token:
                     raise HTTPException(status_code=400, detail={"token_error": token})
 
-            # =========================
-            # USER INFO REQUEST (DEBUG)
-            # =========================
+            # USER INFO
             async with session.get(
                 "https://apis.roblox.com/oauth/v1/userinfo",
-                headers={
-                    "Authorization": f"Bearer {token['access_token']}"
-                },
+                headers={"Authorization": f"Bearer {token['access_token']}"},
             ) as r:
 
                 user_text = await r.text()
                 print("USER STATUS:", r.status)
                 print("USER RESPONSE:", user_text)
 
-                try:
-                    user = await r.json()
-                except:
-                    raise HTTPException(status_code=400, detail=f"User not JSON: {user_text}")
+                user = await r.json()
 
                 if r.status != 200 or "sub" not in user:
                     raise HTTPException(status_code=400, detail={"user_error": user})
 
         # =========================
-        # SAVE TO MONGO
+        # SAVE / REPLACE ONLY (NO DUPLICATES)
         # =========================
         await col.update_one(
             {"discordId": discord_id},
@@ -141,10 +180,7 @@ async def callback(request: Request):
             upsert=True,
         )
 
-        return {
-            "ok": True,
-            "robloxId": user["sub"]
-        }
+        return HTMLResponse(verified_page())
 
     except Exception as e:
         print("FATAL ERROR:")
