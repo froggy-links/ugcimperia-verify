@@ -40,7 +40,7 @@ async def auth(discord_id: str):
         raise HTTPException(status_code=400, detail="missing discord_id")
 
     url = (
-        "https://authorize.roblox.com/v1/authorize"
+        "https://apis.roblox.com/oauth/v1/authorize"
         f"?client_id={CLIENT_ID}"
         "&response_type=code"
         f"&redirect_uri={REDIRECT_URI}"
