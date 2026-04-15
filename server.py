@@ -1,6 +1,9 @@
 import os
+import uuid
 import aiohttp
 import traceback
+from datetime import datetime
+
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import RedirectResponse, HTMLResponse
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -34,14 +37,16 @@ app = FastAPI()
 # =========================
 mongo = AsyncIOMotorClient(MONGO_URI)
 db = mongo["ugcearn"]
-col = db["linked_ids"]
+
+users = db["linked_ids"]
+sessions = db["sessions"]
 
 # =========================
 # ROOT
 # =========================
 @app.get("/")
 async def root():
-    return {"status": "running", "debug": "ok"}
+    return {"status": "running"}
 
 # =========================
 # AUTH START
@@ -51,19 +56,27 @@ async def auth(discord_id: str):
     if not discord_id:
         raise HTTPException(status_code=400, detail="missing discord_id")
 
+    session_id = str(uuid.uuid4())
+
+    await sessions.insert_one({
+        "sessionId": session_id,
+        "discordId": discord_id,
+        "createdAt": datetime.utcnow()
+    })
+
     url = (
         "https://apis.roblox.com/oauth/v1/authorize"
         f"?client_id={CLIENT_ID}"
         "&response_type=code"
         f"&redirect_uri={REDIRECT_URI}"
         "&scope=openid"
-        f"&state={discord_id}"
+        f"&state={session_id}"
     )
 
     return RedirectResponse(url)
 
 # =========================
-# SUCCESS PAGE
+# VERIFIED PAGE
 # =========================
 def verified_page():
     return """
@@ -71,7 +84,6 @@ def verified_page():
     <html>
     <head>
         <title>Verified</title>
-        <meta http-equiv="refresh" content="5;url=https://discord.com">
         <style>
             body {
                 margin: 0;
@@ -80,7 +92,7 @@ def verified_page():
                 align-items: center;
                 justify-content: center;
                 background: #0b0f14;
-                font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+                font-family: system-ui, Arial;
                 color: white;
             }
 
@@ -88,30 +100,28 @@ def verified_page():
                 text-align: center;
                 padding: 40px 50px;
                 border-radius: 14px;
-                background: rgba(255, 255, 255, 0.04);
-                border: 1px solid rgba(255, 255, 255, 0.08);
-                backdrop-filter: blur(10px);
+                background: rgba(255,255,255,0.04);
+                border: 1px solid rgba(255,255,255,0.08);
             }
 
             h1 {
                 font-size: 42px;
-                letter-spacing: 2px;
-                margin: 0;
                 color: #22c55e;
+                margin: 0;
+                letter-spacing: 2px;
             }
 
             p {
                 margin-top: 10px;
+                color: rgba(255,255,255,0.7);
                 font-size: 15px;
-                color: rgba(255, 255, 255, 0.7);
             }
         </style>
     </head>
-
     <body>
         <div class="card">
             <h1>VERIFIED</h1>
-            <p>You’re all set — feel free to close this page.</p>
+            <p>You’re all set — you can close this page.</p>
         </div>
     </body>
     </html>
@@ -124,19 +134,26 @@ def verified_page():
 async def callback(request: Request):
     try:
         code = request.query_params.get("code")
-        discord_id = request.query_params.get("state")
+        state = request.query_params.get("state")
 
-        print("CALLBACK HIT")
-        print("CODE:", code)
-        print("STATE:", discord_id)
+        if not code or not state:
+            raise HTTPException(400, "missing code/state")
 
-        if not code or not discord_id:
-            raise HTTPException(status_code=400, detail="missing code/state")
+        # -------------------------
+        # GET SESSION
+        # -------------------------
+        session = await sessions.find_one({"sessionId": state})
+        if not session:
+            raise HTTPException(400, "invalid session")
 
-        async with aiohttp.ClientSession() as session:
+        discord_id = session["discordId"]
 
+        async with aiohttp.ClientSession() as session_http:
+
+            # -------------------------
             # TOKEN
-            async with session.post(
+            # -------------------------
+            async with session_http.post(
                 "https://apis.roblox.com/oauth/v1/token",
                 data={
                     "grant_type": "authorization_code",
@@ -147,54 +164,63 @@ async def callback(request: Request):
                 },
             ) as r:
 
-                token_text = await r.text()
-                print("TOKEN STATUS:", r.status)
-                print("TOKEN RESPONSE:", token_text)
-
                 token = await r.json()
 
                 if r.status != 200 or "access_token" not in token:
-                    raise HTTPException(status_code=400, detail={"token_error": token})
+                    raise HTTPException(400, {"token_error": token})
 
+            # -------------------------
             # USER INFO
-            async with session.get(
+            # -------------------------
+            async with session_http.get(
                 "https://apis.roblox.com/oauth/v1/userinfo",
                 headers={"Authorization": f"Bearer {token['access_token']}"},
             ) as r:
 
-                user_text = await r.text()
-                print("USER STATUS:", r.status)
-                print("USER RESPONSE:", user_text)
-
                 user = await r.json()
 
                 if r.status != 200 or "sub" not in user:
-                    raise HTTPException(status_code=400, detail={"user_error": user})
+                    raise HTTPException(400, {"user_error": user})
 
-        # =========================
-        # SAVE / REPLACE ONLY (NO DUPLICATES)
-        # =========================
-        await col.update_one(
+        # -------------------------
+        # SAVE USER (NO DUPLICATES)
+        # -------------------------
+        await users.update_one(
             {"discordId": discord_id},
-            {"$set": {"robloxId": user["sub"]}},
-            upsert=True,
+            {
+                "$set": {
+                    "robloxId": user["sub"]
+                },
+                "$setOnInsert": {
+                    "tokens": 0
+                }
+            },
+            upsert=True
         )
+
+        # -------------------------
+        # CLEAN SESSION
+        # -------------------------
+        await sessions.delete_one({"sessionId": state})
 
         return HTMLResponse(verified_page())
 
     except Exception as e:
-        print("FATAL ERROR:")
+        print("ERROR:")
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(500, str(e))
 
 # =========================
 # GET USER
 # =========================
 @app.get("/user/{discord_id}")
 async def get_user(discord_id: str):
-    data = await col.find_one({"discordId": discord_id})
+    data = await users.find_one({"discordId": discord_id})
 
     if not data:
-        return {"robloxId": None}
+        return {"robloxId": None, "tokens": None}
 
-    return {"robloxId": data.get("robloxId")}
+    return {
+        "robloxId": data.get("robloxId"),
+        "tokens": data.get("tokens", 0)
+    }
